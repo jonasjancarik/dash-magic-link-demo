@@ -1,4 +1,4 @@
-from dash import Dash, html, dcc, Input, Output, State, ALL, ctx
+from dash import Dash, html, dcc, Input, Output, State, ALL
 import dash_bootstrap_components as dbc
 import boto3
 from botocore.exceptions import ClientError
