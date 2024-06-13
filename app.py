@@ -1,4 +1,4 @@
-from dash import Dash, html, dcc, Input, Output, State
+from dash import Dash, html, dcc, Input, Output, State, ALL, ctx
 import dash_bootstrap_components as dbc
 import boto3
 from botocore.exceptions import ClientError
@@ -16,14 +16,22 @@ load_dotenv()
 
 # Initialize the Dash application
 server = Flask(__name__)
-app = Dash(__name__, server=server, external_stylesheets=[dbc.themes.BOOTSTRAP])
+app = Dash(
+    __name__,
+    server=server,
+    external_stylesheets=[dbc.themes.BOOTSTRAP],
+    prevent_initial_callbacks="initial_duplicate",
+)
 
 app.title = "Simple Authentication Example"
 
 
 def load_user_db():
-    with open("users_db.json", "r") as f:
-        return json.load(f)
+    try:
+        with open("users_db.json", "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        os.exit("users_db.json not found. Please create the file.")
 
 
 def save_user_db(users_db):
@@ -40,20 +48,42 @@ def save_token(email):
     token = token_urlsafe(16)
     users_db = load_user_db()
     users_db[email]["tokens"].append(
-        {"token": hash_secret(token), "expiration": time.time() + 31536000}
+        {"hash": hash_secret(token), "expiration": time.time() + 31536000}
     )
     save_user_db(users_db)
     return token
 
 
-def authenticate(token):
-    hashed_token = hash_secret(token)
-    users_db = load_user_db()
-    for email, data in users_db.items():
-        for t in data["tokens"]:
-            if t["token"] == hashed_token and t["expiration"] > time.time():
-                return email, data["name"]
-    return None, None
+def authenticate(login_code=None, web_app_token=None):
+    data = load_user_db()
+
+    if login_code:
+        login_code_hash = hash_secret(login_code)
+        for email, user_data in data.items():
+            for code in user_data.get("login_codes", []):
+                if code["hash"] == login_code_hash and code["expiration"] > int(
+                    time.time()
+                ):
+                    user_data["login_codes"].remove(code)
+                    save_user_db(data)
+                    return {
+                        "email": email,
+                        "name": user_data["name"],
+                    }
+
+    if web_app_token:
+        hashed_token = hash_secret(web_app_token)
+        for email, user_data in data.items():
+            for token in user_data.get("tokens", []):
+                if token["hash"] == hashed_token and token["expiration"] > int(
+                    time.time()
+                ):
+                    return {
+                        "email": email,
+                        "name": user_data["name"],
+                    }
+
+    return False
 
 
 def send_magic_link(email, login_code):
@@ -98,6 +128,10 @@ def get_login_code_from_url(search):
     return query_params.get("login_code", [None])[0]
 
 
+def random_index():
+    return random.randint(0, 999999)
+
+
 # Layout
 app.layout = html.Div(
     [
@@ -137,7 +171,27 @@ app.layout = html.Div(
         dbc.Container(
             [
                 dbc.Row(
-                    dbc.Col(
+                    [
+                        dbc.Col(
+                            id={"type": "toggle-element", "index": random_index()},
+                            className="show-logged-out d-none",
+                            children=[
+                                html.H2("Welcome! Please log in."),
+                            ],
+                        ),
+                        dbc.Col(
+                            id={"type": "toggle-element", "index": random_index()},
+                            className="show-logged-in d-none",
+                            children=[
+                                html.H2("Welcome back! You are logged in."),
+                            ],
+                        ),
+                    ]
+                ),
+                dbc.Row(
+                    id={"type": "toggle-element", "index": random_index()},
+                    className="show-logged-out d-none",
+                    children=dbc.Col(
                         [
                             html.Div(
                                 id="login-form",
@@ -183,14 +237,16 @@ app.layout = html.Div(
                                     ),
                                 ],
                             ),
-                            html.Div(id="login-status", className="text-center"),
+                            html.Div(id="login-status"),
                         ],
                         className="d-flex flex-column align-items-center justify-content-center",
-                    )
+                    ),
                 ),
             ]
         ),
         dcc.Store(id="authenticated", storage_type="local"),
+        dcc.Store(id="dash_app_context", storage_type="local"),
+        dcc.Input(id="page-load-trigger", type="hidden", value="trigger"),
     ]
 )
 
@@ -231,37 +287,61 @@ def handle_send_link(n_clicks, email):
 
 
 @app.callback(
-    Output("login-status", "children"),
-    Output("authenticated", "data"),
-    [Input("login-btn", "n_clicks"), Input("url", "search")],
-    [State("login-code-input", "value")],
+    [
+        Output("authenticated", "data", allow_duplicate=True),
+        Output("dash_app_context", "data", allow_duplicate=True),
+    ],
+    [
+        Input("url", "search"),
+        Input("login-code-input", "value"),
+        Input("dash_app_context", "data"),
+    ],
 )
-def handle_login(n_clicks, search, login_code_input):
-    login_code = login_code_input or get_login_code_from_url(search)
-    if login_code:
-        users_db = load_user_db()
-        for email, data in users_db.items():
-            for code in data.get("login_codes", []):
-                if (
-                    code["hash"] == hash_secret(login_code)
-                    and code["expiration"] > time.time()
-                ):
-                    data["login_codes"].remove(code)
-                    save_user_db(users_db)
-                    token = save_token(email)
-                    return f"Welcome, {data['name']}!", {
-                        "email": email,
-                        "name": data["name"],
-                        "token": token,
-                    }
-        return "Invalid or expired login code.", None
-    return "", None
+def handle_login(search, login_code_input, dash_app_context):
+    # todo: only trigger login_code check if it's the right length
+    login_code_from_url = parse_qs(search.lstrip("?")).get("login_code", [None])[0]
+    login_code_entered = login_code_input
+    login_code = login_code_entered or login_code_from_url
+    web_app_token = dash_app_context.get("web_app_token") if dash_app_context else None
+
+    if user := authenticate(login_code=login_code, web_app_token=web_app_token):
+        return (
+            True,
+            {
+                "web_app_token": web_app_token or save_token(user["email"]),
+                "user": user,
+            },
+        )
+    else:
+        return (
+            False,
+            {"web_app_token": None},
+        )
 
 
-@app.callback(Output("user-display", "children"), Input("authenticated", "data"))
-def update_user_display(authenticated):
+# handle logout
+@app.callback(
+    [
+        Output("authenticated", "data"),
+        Output("dash_app_context", "data"),
+        Output("email-form", "style", allow_duplicate=True),
+        Output("code-form", "style", allow_duplicate=True),
+    ],
+    [Input("logout-btn", "n_clicks")],
+    prevent_initial_call=True,
+)
+def handle_logout(n_clicks):
+    return False, {"web_app_token": None}, {"display": "block"}, {"display": "none"}
+
+
+@app.callback(
+    Output("user-display", "children"),
+    Input("authenticated", "data"),
+    State("dash_app_context", "data"),
+)
+def update_user_display(authenticated, dash_app_context):
     if authenticated:
-        return f"Hello, {authenticated['name']}"
+        return f"Hello, {dash_app_context['user']['name']}"
     return ""
 
 
@@ -281,6 +361,52 @@ def logout(n_clicks):
     if n_clicks:
         return "/?logout=true"
     return "/"
+
+
+# Callback to show/hide elements based on login state using pattern-matching
+@app.callback(
+    Output({"type": "toggle-element", "index": ALL}, "className"),
+    [Input("authenticated", "data"), Input("page-load-trigger", "value")],
+    [
+        State({"type": "toggle-element", "index": ALL}, "id"),
+        State({"type": "toggle-element", "index": ALL}, "className"),
+    ],
+)
+def update_element_visibility(authenticated, trigger, ids, current_classes):
+    updated_classes = []
+    for i, element_id in enumerate(ids):
+        if (
+            current_classes[i] is None
+        ):  # this shouldn't happen because the element should have a class defining whether it should be shown or hidden
+            current_classes[i] = ""
+
+        class_to_add = None
+
+        # update the class list based on the login state and display class
+        if "show-logged-in" in current_classes[i]:
+            if authenticated:
+                # remove d-none from the class list
+                current_classes[i] = current_classes[i].replace("d-none", "")
+            else:
+                class_to_add = "d-none"
+
+        elif "show-logged-out" in current_classes[i]:
+            if not authenticated:
+                # remove d-none from the class list
+                current_classes[i] = current_classes[i].replace("d-none", "")
+            else:
+                class_to_add = "d-none"
+
+        else:
+            updated_classes.append(current_classes[i])
+            continue
+
+        if class_to_add and class_to_add not in current_classes[i]:
+            updated_classes.append(current_classes[i] + " " + class_to_add)
+        else:
+            updated_classes.append(current_classes[i])
+
+    return updated_classes
 
 
 if __name__ == "__main__":
